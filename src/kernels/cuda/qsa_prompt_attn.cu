@@ -38,6 +38,16 @@ constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free 
 #define STRATA_PA_SM80 0
 #endif
 
+// Turing (sm_75) takes the m16n8k8 MMA above but has no cp.async, so the pipeline below issues and waits on
+// synchronous 16-byte copies instead.  Same set as the mma16816 branch: CUDA device code for an arch in [750, 800).
+// Everywhere else (host pass, AMD, pre-Turing, sm_80+) the cp.async form compiles, and the host only reaches it on
+// a card that has cp.async.
+#if defined(__HIPCC__) || !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 750 || __CUDA_ARCH__ >= 800
+#define STRATA_PA_SM75 0
+#else
+#define STRATA_PA_SM75 1
+#endif
+
 // m16n8k16 with f16 inputs needs sm_80.  Turing (sm_75) has m16n8k8 with the SAME A/B/C register mapping, so the
 // k=16 step is two k=8 steps on the fragments as they are already laid out: a[0]/a[1] are rows gid/gid+8 at k columns
 // 2*tig..2*tig+1 (b[0]'s k rows), a[2]/a[3] the same rows at k columns 2*tig+8..2*tig+9 (b[1]'s k rows).  The
@@ -379,10 +389,18 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
 // double-buffered stage while it computes the previous chunk, and q stays in registers. Only the q.k partial sums
 // (one per dim group) cross warps, and they are added in a fixed order: the result is deterministic.
 constexpr int CH2 = 32;
+#if STRATA_PA_SM75
+// ONE STAGE ON TURING.  The cp.async path issues the next chunk into the other stage while the current one is
+// computed; the sm_75 copy is synchronous, so that overlap does not exist and the second stage only doubled the
+// shared memory - which kept the kernel at one block per SM (Turing has 64 KB).  With one stage it fits twice.
+constexpr int PA_STAGES = 1;
+#else
+constexpr int PA_STAGES = 2;
+#endif
 
 struct Smem2 {
-    int8_t kv[2][4][2][CH2][64];   // stage, warp, K/V, cell, 64 dims in 16-byte pieces XOR-swizzled by the cell
-    float sc[2][4][2][CH2];        // stage, warp, K/V scale of the cell for the warp's group
+    int8_t kv[PA_STAGES][4][2][CH2][64];   // stage, warp, K/V, cell, 64 dims in 16-byte pieces XOR-swizzled by the cell
+    float sc[PA_STAGES][4][2][CH2];        // stage, warp, K/V scale of the cell for the warp's group
     float part[4][16][CH2 + 1];    // q.k per dim group
     float p[16][CH2 + 1];
     float qmax[4];
@@ -481,9 +499,47 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_i8_kernel(const float* __
         ksr = r >= 0 ? __half2float(__ushort_as_half(__ldg(p.k_scale + r * (HD / KV_Q8_GROUP) + warp))) : 0.0f;
         vsr = r >= 0 ? __half2float(__ushort_as_half(__ldg(p.v_scale + r * (HD / KV_Q8_GROUP) + warp))) : 0.0f;
     };
+#if STRATA_PA_SM75
+    // SOFTWARE PIPELINE FOR TURING.  There is no cp.async, so `issue` above is a synchronous load+store and the
+    // key/value latency lands in front of the compute.  These two halves let the load start BEFORE the compute
+    // and be committed to the (single) stage after it, which is where the overlap the cp.async path had comes
+    // from.  The rows are carried in registers for the whole chunk.
+    struct KvRegs { uint4 k[4], v[4]; };
+    auto issue_load = [&](long long r, KvRegs& regs) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int idx = lane + 32 * j, cell = idx >> 2, pc = idx & 3;
+            const long long rr = __shfl_sync(0xffffffffu, r, cell);
+            const bool ok = rr >= 0;
+            const size_t off = ok ? (size_t) rr * HD + dim0 + pc * 16 : 0;
+            regs.k[j] = ok ? *reinterpret_cast<const uint4*>(p.k_q + off) : make_uint4(0u, 0u, 0u, 0u);
+            regs.v[j] = ok ? *reinterpret_cast<const uint4*>(p.v_q + off) : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+    auto issue_store = [&](int st, const KvRegs& regs) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int idx = lane + 32 * j, cell = idx >> 2, pc = idx & 3;
+            *reinterpret_cast<uint4*>(&S.kv[st][warp][0][0][0] + swz(cell, pc * 16)) = regs.k[j];
+            *reinterpret_cast<uint4*>(&S.kv[st][warp][1][0][0] + swz(cell, pc * 16)) = regs.v[j];
+        }
+    };
+#endif
     float ksn, vsn;
+#if STRATA_PA_SM75
+    KvRegs kvregs;
+    issue_load(row_of(cell_of(lane)), kvregs);
+    issue_store(0, kvregs);
+    ksn = 0.0f; vsn = 0.0f;
+    {
+        const long long r0 = row_of(cell_of(lane));
+        ksn = r0 >= 0 ? __half2float(__ushort_as_half(__ldg(p.k_scale + r0 * (HD / KV_Q8_GROUP) + warp))) : 0.0f;
+        vsn = r0 >= 0 ? __half2float(__ushort_as_half(__ldg(p.v_scale + r0 * (HD / KV_Q8_GROUP) + warp))) : 0.0f;
+    }
+#else
     issue(row_of(cell_of(lane)), 0, ksn, vsn);
     cp_async_commit();
+#endif
     S.sc[0][warp][0][lane] = ksn;
     S.sc[0][warp][1][lane] = vsn;
     long long r_next = row_of(cell_of(CH2 + lane));
@@ -494,13 +550,18 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_i8_kernel(const float* __
     for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
 
     for (int ci = 0; ci < n_chunks; ++ci) {
-        const int st = ci & 1, c0 = ci * CH2;
+        const int st = STRATA_PA_SM75 ? 0 : (ci & 1), c0 = ci * CH2;
         const bool more = ci + 1 < n_chunks;
+#if STRATA_PA_SM75
+        // the load starts here and the compute below hides its latency
+        if (more) issue_load(r_next, kvregs);
+#else
         if (more) issue(r_next, st ^ 1, ksn, vsn);
         cp_async_commit();
         r_next = row_of(cell_next2);
         cell_next2 = cell_of((ci + 3) * CH2 + lane);
         cp_async_wait1();
+#endif
         __syncwarp();
         const int8_t* K = &S.kv[st][warp][0][0][0];
         const int8_t* V = &S.kv[st][warp][1][0][0];
@@ -611,8 +672,20 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_i8_kernel(const float* __
             }
         }
         if (more) {
+#if STRATA_PA_SM75
+            // the registers loaded at the top of this iteration land here, after every read of the stage
+            issue_store(0, kvregs);
+            const long long rr = r_next;
+            ksn = rr >= 0 ? __half2float(__ushort_as_half(__ldg(p.k_scale + rr * (HD / KV_Q8_GROUP) + warp))) : 0.0f;
+            vsn = rr >= 0 ? __half2float(__ushort_as_half(__ldg(p.v_scale + rr * (HD / KV_Q8_GROUP) + warp))) : 0.0f;
+            r_next = row_of(cell_next2);
+            cell_next2 = cell_of((ci + 3) * CH2 + lane);
+            S.sc[0][warp][0][lane] = ksn;
+            S.sc[0][warp][1][lane] = vsn;
+#else
             S.sc[st ^ 1][warp][0][lane] = ksn;
             S.sc[st ^ 1][warp][1][lane] = vsn;
+#endif
         }
         __syncwarp();
     }
