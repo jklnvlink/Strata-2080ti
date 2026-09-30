@@ -25,6 +25,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
+#include "strata/core/tc_sm75.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -4425,11 +4426,28 @@ int main(int argc, char** argv) {
             }
             return true;
         };
-        sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+        // E-9: the batched draft pass belongs to the stage that owns the drafter, which a layer split puts on the
+        // LAST card - `mtp.bind` above was given that stage's weights and head, and `draft_kv` uses the Prefill's
+        // own region, GEMM and MMQ context.  It used to be skipped whenever the model was split (`!multi_gpu`),
+        // which sent every chunk through the drafter's own per-window prefill instead: measured on 2x2080 Ti,
+        // **98 ms per 2,048-token chunk** against about 2 ms of GPU work for the same tokens.
+        strata::prefill::Prefill* const draft_sp = multi_gpu ? &stages.back()->sp : &sp;
+        // ... and it is a TURING (cc 7.5) change: on any other card the split keeps the drafter's own prefill
+        // path, so no other SM model runs different code because of this tree.
+        bool draft_batch_on_split = false;
+        if (multi_gpu) {
+            int major = 0, minor = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, stages.back()->dev) == cudaSuccess &&
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, stages.back()->dev) == cudaSuccess) {
+                draft_batch_on_split = strata::core::tc_sm75_enabled(major, minor);
+            } else {
+                cudaGetLastError();
+            }
+        }
+        sp.on_chunk = [&, draft_sp, draft_batch_on_split](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
-            // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
-            const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+            const bool batched = (!multi_gpu || draft_batch_on_split) && draft_sp->draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
             if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
