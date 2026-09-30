@@ -57,6 +57,11 @@ private:
 
 /// A GGUF-native expert (gate at `gate`, up at `up`, down at `down`, each its GGUF rows) into a group buffer's
 /// slot: gate rows then up rows at `gu_dst`, down at `d_dst`.
+/// The same copy for a whole group of experts at once (`src_dev` is a caller-owned device array of 3 * n
+/// pointers, reused every group).  sm_75 only - see the kernel comment.
+void gather_native_group(const void* const* gates, const void* const* ups, const void* const* downs,
+                         const void** src_dev, size_t gu_half_bytes, size_t d_bytes, void* gu_dst, void* d_dst,
+                         int n, void* stream);
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream);
 /// A Strata-pack Q2_0 expert blob (codes and fp16 scales in separate planes, gate/up rows interleaved) into GGUF

@@ -167,6 +167,48 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
     ck(cudaGetLastError(), "gather_native");
 }
 
+/// sm_75: the whole GROUP's experts in one launch.  The per-expert `gather_native` copies 2.15 MB and measures
+/// 247 GB/s (8.7 us a launch, 8,651 of them for a 4K prompt) because sixteen 256-thread blocks cannot fill the
+/// card; this flat grid covers every byte of the group with as many blocks as the copy needs, and the source
+/// pointers come from a small device array (the experts of a group live wherever the cache or the staging put
+/// them, so their addresses are not derivable from one base).
+__global__ void copy16_group_kernel(const uint4* const* __restrict__ a, const uint4* const* __restrict__ b,
+                                    const uint4* const* __restrict__ c, int64_t na, int64_t nc,
+                                    uint4* __restrict__ ab_dst, uint4* __restrict__ c_dst, int64_t gu_stride,
+                                    int64_t d_stride, int64_t per_expert) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int e = (int) (i / per_expert);
+    const int64_t r = i - (int64_t) e * per_expert;
+    if (r < 2 * na) {
+        uint4* dst = ab_dst + (int64_t) e * gu_stride;
+        dst[r] = (r < na) ? a[e][r] : b[e][r - na];
+    } else {
+        uint4* dst = c_dst + (int64_t) e * d_stride;
+        dst[r - 2 * na] = c[e][r - 2 * na];
+    }
+}
+
+void gather_native_group(const void* const* gates, const void* const* ups, const void* const* downs,
+                         const void** src_dev, size_t gu_half_bytes, size_t d_bytes, void* gu_dst, void* d_dst,
+                         int n, void* stream) {
+    if (n <= 0) return;
+    const cudaStream_t s = (cudaStream_t) stream;
+    // one small upload: 3 * n source pointers (the device array is owned by the caller and reused)
+    if (cudaMemcpyAsync((void*) src_dev, gates, (size_t) n * sizeof(void*), cudaMemcpyHostToDevice, s) != cudaSuccess ||
+        cudaMemcpyAsync((void*) (src_dev + n), ups, (size_t) n * sizeof(void*), cudaMemcpyHostToDevice, s) != cudaSuccess ||
+        cudaMemcpyAsync((void*) (src_dev + 2 * n), downs, (size_t) n * sizeof(void*), cudaMemcpyHostToDevice, s) != cudaSuccess) {
+        std::fprintf(stderr, "gather_native_group: the pointer upload failed\n");
+        std::exit(1);
+    }
+    const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16;
+    const int64_t per_expert = 2 * na + nc, total = per_expert * n;
+    const int64_t gu_stride = 2 * na, d_stride = nc;
+    copy16_group_kernel<<<blocks(total), 256, 0, s>>>((const uint4* const*) src_dev, (const uint4* const*) (src_dev + n),
+                                                      (const uint4* const*) (src_dev + 2 * n), na, nc, (uint4*) gu_dst,
+                                                      (uint4*) d_dst, gu_stride, d_stride, per_expert);
+    ck(cudaGetLastError(), "gather_native_group");
+}
+
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
     strata_q2_kernel<<<blocks(1280LL * 40 + 2560LL * 10), 256, 0, (cudaStream_t) stream>>>(blob, (uint16_t*) gu_dst,
                                                                                          (uint16_t*) d_dst);
