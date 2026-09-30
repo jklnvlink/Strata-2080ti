@@ -1,5 +1,6 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
+#include "strata/core/tc_sm75.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/router_top10.hpp"
 
@@ -13,6 +14,24 @@
 
 namespace strata::prefill {
 namespace {
+
+/// sm_75 (Turing) and only sm_75: the device this file's kernels are being launched on.  Asked once - the
+/// answer cannot change inside a process.  Everything gated on it keeps its original kernel for every other
+/// SM model, so an RTX 30/40/50 runs exactly what it ran before.
+bool tc_sm75() {
+    static const bool on = [] {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return false; }
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        return strata::core::tc_sm75_enabled(major, minor);
+    }();
+    return on;
+}
 
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
 constexpr int S = 128, HK = 16, HV = 48, C = 10240;
@@ -555,6 +574,36 @@ __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* 
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
 
+/// sm_75: the same combine with one float4 per thread instead of one float.  The scalar kernel reads ten
+/// expert rows per output element with a single FMA chain and no vectorisation (measured 29 ms for a
+/// 2,048-token chunk whose traffic floor is 0.43 ms); four outputs per thread give four independent chains,
+/// 16-byte loads and a quarter of the threads.  **The arithmetic per element is unchanged** - the same ten
+/// `fmaf`s in the same order, the same `sigm(sg[t])` - so this cannot change a value.
+__global__ void moe_combine_kernel_sm75(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                        const float* __restrict__ w, const float* __restrict__ shared,
+                                        const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
+    constexpr int64_t PER_ROW = N / 4;
+    const int64_t i4 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i4 >= T * PER_ROW) return;
+    const int64_t t = i4 / PER_ROW, d4 = i4 % PER_ROW;
+    const int32_t* sl = slot + t * 10;
+    const float* wt = w + t * 10;
+    float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const float4 v = *reinterpret_cast<const float4*>(Dm + (int64_t) sl[k] * N + d4 * 4);
+        const float wk = wt[k];
+        s.x = fmaf(wk, v.x, s.x);
+        s.y = fmaf(wk, v.y, s.y);
+        s.z = fmaf(wk, v.z, s.z);
+        s.w = fmaf(wk, v.w, s.w);
+    }
+    const float4 sh = *reinterpret_cast<const float4*>(shared + t * N + d4 * 4);
+    const float g = sigm(sg[t]);
+    const float4 o = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
+    *reinterpret_cast<float4*>(bo + t * N + d4 * 4) = o;
+}
+
 // ---------------------------------------------------------------- QSA helpers
 __global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t cols, int64_t ld, float eps) {
     __shared__ float sh[32];
@@ -821,7 +870,12 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
-    moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
+    // sm_75 only: the vectorised form is selected by the device, so no other SM model runs it.
+    if (tc_sm75() && N % 4 == 0) {
+        moe_combine_kernel_sm75<<<blocks_for(T * N / 4), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
+    } else {
+        moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
+    }
     check("moe_combine");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
