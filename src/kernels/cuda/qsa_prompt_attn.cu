@@ -1,5 +1,6 @@
 // src/kernels/cuda/qsa_prompt_attn.cu - see include/strata/kernels/qsa_prompt_attn.hpp.
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/core/tc_sm75.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
@@ -767,19 +768,23 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
         // no cp.async, so it runs the v1 kernel (launch<1>, same accuracy, another summation order).  An older card
         // keeps the old kernel.
-        static int cc_major[64] = {};
+        static int cc[64] = {};                      // the minor is packed in the low byte: (major << 8) | minor
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
-        if (cc_major[dev] == 0) {
-            int major = 0;
-            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        if (cc[dev] == 0) {
+            int major = 0, minor = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
                 cudaGetLastError();
                 return false;
             }
-            cc_major[dev] = major;
+            cc[dev] = (major << 8) | (minor & 0xff);
         }
-        if (cc_major[dev] < 7) return false;
-        turing = cc_major[dev] < 8;
+        const int major = cc[dev] >> 8, minor = cc[dev] & 0xff;
+        // sm_80 or newer uses the tensor-core kernel with cp.async; 7.5 (Turing, STRATA_TC_SM75) uses the same
+        // MMA with a synchronous copy; every other card keeps the decode kernel.
+        if (major < 8 && !strata::core::tc_sm75_enabled(major, minor)) return false;
+        turing = major < 8;
     }
 #if defined(__HIPCC__)
     return false;   // the tensor-core kernel is compiled out on AMD (its major version is not a CUDA sm)

@@ -171,6 +171,12 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
 
+# The sm_75 (Turing) gate: "the 2080 Ti paths are for compute capability 7.5 and nothing else".  Host-only, no
+# GPU, always built - it is the contract every kernel and buffer decision in this tree asks at run time, and a
+# regression in it would move another GPU generation onto Turing kernels without changing any benchmark here.
+add_executable(tc_sm75_gate_test src/core/tc_sm75_gate_test.cpp)
+target_link_libraries(tc_sm75_gate_test PRIVATE strata_artifact)
+
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
