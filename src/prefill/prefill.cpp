@@ -5,6 +5,8 @@
 #include "strata/core/on_device.hpp"
 
 #include "strata/core/layout.hpp"
+#include "strata/core/tc_sm75.hpp"
+
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -61,6 +63,11 @@ void iota(int32_t*, int64_t, void*) {}
 #endif
 
 namespace strata::prefill {
+
+namespace {
+/// Defined beside the projection helpers below; declared here because `Prefill::init` sizes buffers from it.
+bool tc_sm75();
+}  // namespace
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -301,6 +308,9 @@ struct Prefill::Impl {
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
     float* grs = nullptr;                    // F-1: the hyper-connection read's row scales (T x 4)
     uint16_t *xn16 = nullptr, *lo16 = nullptr;
+    // sm_75: the fp16 images the hyper-connection projections' tensor-core path reads (and the
+    // staging the bf16 weights are re-encoded into, one matrix at a time - 6.55 MB, not 1.9 GB).
+    uint16_t *xn16_f16 = nullptr, *lo16_f16 = nullptr, *hc_w16 = nullptr;
     float* mixed = nullptr;
     uint16_t *mixed_bf = nullptr, *mixed_h = nullptr;
     uint16_t *xn16_lo = nullptr, *lo16_lo = nullptr, *mixed_bf_lo = nullptr;   // bf16x2(): the BF16 GEMMs' low parts
@@ -635,6 +645,10 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.xn = gr_unfused() ? o.take<float>(T * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
     m.grs = o.take<float>(T * HC, ok);
     m.xn16 = o.take<uint16_t>(T * D, ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
+    if (tc_sm75()) {
+        m.xn16_f16 = o.take<uint16_t>(T * D, ok); m.lo16_f16 = o.take<uint16_t>(T * LR, ok);
+        m.hc_w16 = o.take<uint16_t>((size_t) g.hc * (size_t) g.n_embd * (size_t) LR, ok);
+    }
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok); m.bo = o.take<float>(T * N, ok);
@@ -852,6 +866,10 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         proj(hn, hn16, w_fh, h2, nb * g.hc, Nn, Nn, 1);   // every stream through fc_hidden
         strata::kernels::add_streams_broadcast(h2, e2, Rm, Nn, (int) g.hc, (int) nb, m.cs);
         // the attention hyper-connection's read (its mixed input only: this pass writes nothing back)
+        // THE DRAFT LAYER STAYS BF16.  It was moved to the fp16 tensor core with the main layers and that cost
+        // 27 points of draft acceptance (93% -> 66% on the 1K prompt, measured): the drafted tokens are a
+        // discrete choice, so an accumulation-order change there is a behaviour change and not a speed one, and
+        // the GEMMs are a few tokens wide - there was nothing to win.
         gr_norm_rs(Rm, w_hn, EPS, grs, xn16, nb, m.cs);
         m.gemm.bf16(xn16, w_dn, lo, nb, LR, HCN);
         gr_silu(lo, lo16, nb, m.cs);
@@ -939,6 +957,38 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
     if (w->kind != core::WeightKind::Bf16InF32 || !w->data) { err = "prefill: " + name + " is not a resident BF16 tensor"; return false; }
     gm.bf16(X, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy);
     if (X_lo) gm.bf16(X_lo, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 1.0f);
+    return true;
+}
+
+/// sm_75: is the Turing tensor-core path on for the device this prompt runs on?  Asked once and cached - the
+/// answer cannot change inside a process (a layer split keeps one device per stage).
+bool tc_sm75() {
+    static const bool on = [] {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return false; }
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        return core::tc_sm75_enabled(major);
+    }();
+    return on;
+}
+
+/// A projection whose weight is BF16 in the arena, re-encoded to fp16 into `w16` (one matrix at a time: 6.55 MB
+/// for the largest) and multiplied on the fp16 tensor core.  The re-encoding is value-preserving - a speed path,
+/// not a precision one - and the conversion shares the compute stream with the GEMM, so the staging buffer
+/// cannot be overwritten while cuBLAS still reads it.
+bool f16_proj_staged(Gemm& gm, const core::WeightRef* w, const uint16_t* X16, uint16_t* w16, float* Y, int64_t T,
+                     const std::string& name, std::string& err, int64_t ldy = 0, void* stream = nullptr) {
+    if (w->kind != core::WeightKind::Bf16InF32 || !w->data || w16 == nullptr) {
+        err = "prefill: " + name + " is not a resident BF16 tensor (or has no fp16 staging)";
+        return false;
+    }
+    const int64_t N = w->ne1 > 0 ? w->ne1 : 1, K = w->ne0;
+    bf16_to_f16((const uint16_t*) w->data, w16, K * N, stream);
+    gm.f16(X16, w16, Y, T, N, K, ldy);
     return true;
 }
 
@@ -1328,13 +1378,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
                 pt.mark(kPfHc, cs);
-                if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
-                else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo);
+// sm_75: with the Turing paths on, the norm/silu kernels also write an fp16 image and the three
+                // projections run on the fp16 tensor core (the weights are re-encoded per half-layer into the
+                // staging buffer, which is 6.55 MB rather than the 1.9 GB a resident fp16 copy would need).
+                const bool hc16 = m.xn16_f16 != nullptr && m.lo16_f16 != nullptr && m.hc_w16 != nullptr;
+                if (gr_unfused())
+                    gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo, m.xn16_f16);
+                else if (!normed)
+                    gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, m.xn16_f16);
                 normed = false;
-                if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
-                gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
-                if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
-                if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
+                if (hc16) {
+                    if (!f16_proj_staged(m.gemm, wd, m.xn16_f16, m.hc_w16, m.lo, T, sd, err, 0, m.cs)) return false;
+                } else if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
+                gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo, m.lo16_f16);
+                if (hc16) {
+                    if (!f16_proj_staged(m.gemm, wu, m.lo16_f16, m.hc_w16, m.gated, T, su, err, 0, m.cs)) return false;
+                } else if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                if (hc16) {
+                    if (!f16_proj_staged(m.gemm, wi, m.xn16_f16, m.hc_w16, m.inj, T, si, err, 0, m.cs)) return false;
+                } else if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
                 if (gr_unfused()) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                               m.mixed_bf_lo);
@@ -1846,8 +1908,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!wnn) return false;
                 }
                 if (wnn) {
-                    gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
-                                     m.xn16_lo);
+gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
+                                     m.xn16_lo, m.xn16_f16);
                     normed = true;
                 } else {
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
