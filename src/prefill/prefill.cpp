@@ -912,6 +912,13 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     o.take<uint8_t>(GEMM_WS, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
     f(T * N); f(T * D); f(T * D); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
+    // sm_75: the fp16 images and the two weight stagings `init` allocates right here.  THIS LIST MUST STAY IN
+    // STEP WITH `init`: the region is sized from it, and a missing entry is not a smaller buffer but an
+    // allocation past the end of the arena (measured: "prefill copy_i32: an illegal memory access").
+    if (tc_sm75()) {
+        o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok);
+        o.take<uint16_t>((size_t) g.hc * (size_t) g.n_embd * (size_t) LR, ok);
+    }
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
     if (bf16x2_hc()) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) o.take<uint16_t>(T * N, ok);
@@ -1337,10 +1344,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     uint16_t* e16 = (uint16_t*) carve_f((size_t) nb * N / 2);
                     uint16_t* e16_lo = bf16x2() ? (uint16_t*) carve_f((size_t) nb * N / 2) : nullptr;
                     const float* emb = m.ple_emb + s0 * N;
+                    // sm_75: these two are BF16 GEMMs as well (FFMA on Turing).  The weights are re-encoded
+                    // to fp16 into a staging buffer once per prompt - 13.1 MB of traffic against the tens of
+                    // milliseconds the FFMA GEMMs take over the whole prompt.
                     if (pw.key_bf16 != nullptr) {
                         to_bf16(emb, e16, nb * N, m.cs, e16_lo);
                         m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
-                        if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
+if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
                     } else {
                         to_f16(emb, e16, nb * N, m.cs);
                         m.gemm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
@@ -1414,8 +1424,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
-                    if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
-                    if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+// sm_75: these two are BF16 GEMMs too (cuBLAS runs them on FFMA on Turing - there is no
+                    // bf16 kernel below sm_80), and their input `mixed_h` is already the fp16 image, so they
+                    // take the same staged fp16 tensor-core path as the hyper-connection projections.
+                    if (hc16 && wa->kind == core::WeightKind::Bf16InF32) {
+                        if (!f16_proj_staged(m.gemm, wa, m.mixed_h, m.hc_w16, m.ab, T,
+                                             v.name("ssm_alpha.weight"), err, 2 * HV, m.cs)) return false;
+                    } else if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV,
+                                          m.mixed_bf_lo)) return false;
+                    if (hc16 && wb->kind == core::WeightKind::Bf16InF32) {
+                        if (!f16_proj_staged(m.gemm, wb, m.mixed_h, m.hc_w16, m.ab + HV, T,
+                                             v.name("ssm_beta.weight"), err, 2 * HV, m.cs)) return false;
+                    } else if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV,
+                                          m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
