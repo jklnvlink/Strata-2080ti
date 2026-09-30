@@ -973,12 +973,13 @@ bool tc_sm75() {
     static const bool on = [] {
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return false; }
-        int major = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
             cudaGetLastError();
             return false;
         }
-        return core::tc_sm75_enabled(major);
+        return core::tc_sm75_enabled(major, minor);
     }();
     return on;
 }
