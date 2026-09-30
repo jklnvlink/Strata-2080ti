@@ -634,6 +634,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(s2_expert_grouped_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME s2_expert_grouped_parity COMMAND s2_expert_grouped_parity --selftest)
 
+  # The sm_75 prompt attention alone (no engine): the other ~10% of a 4K prompt's GPU time.
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/qsa_prompt_attn_bench.cu")
+    add_executable(qsa_prompt_attn_bench bench/micro/qsa_prompt_attn_bench.cu)
+    target_include_directories(qsa_prompt_attn_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(qsa_prompt_attn_bench PRIVATE strata_kernels CUDA::cudart)
+  endif()
+
+  # The resident expert GEMV alone (no engine): the decode's dominant kernel, measured against its traffic floor.
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/expert_gemv_bench.cu")
+    add_executable(expert_gemv_bench bench/micro/expert_gemv_bench.cu)
+    target_include_directories(expert_gemv_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(expert_gemv_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  endif()
+
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/native_mmvq_multi.cpp")
     add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
