@@ -1,5 +1,6 @@
 // src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/core/tc_sm75.hpp"
 
 #include <cuda_runtime.h>
 
@@ -47,6 +48,62 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const fl
     if (lane == 0) {
         if (b == n_bid && n_kv % R != 0) score += 1e9f;
         out[qi * max_blocks + b] = score;
+    }
+}
+
+/// sm_75: the same scores with FOUR BLOCKS PER WARP.  Each block's score is a 4-head, 128-dim dot product whose
+/// cost is dominated by the shuffle reduction (5 steps per head, 20 per block) against only 32 multiply-adds per
+/// lane - so a warp that computes one block spends most of its time in shuffles.  Loading q once per head and
+/// looping over four blocks amortises that: the arithmetic per block is IDENTICAL to the kernel above (same
+/// order, same partials, same reduction tree), so this cannot change a score - it only removes the reloads and
+/// gives each warp four times the work to hide the key latency with.
+/// sm_75 with the Turing paths on: use the four-blocks-per-warp score kernel (numerically identical).
+bool sm75_four_blocks() {
+    static const bool on = [] {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return false; }
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        return strata::core::tc_sm75_enabled(major);
+    }();
+    return on;
+}
+
+constexpr int SCORE_BPW = 16;
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel_sm75(
+        const float* __restrict__ pooled, const float* __restrict__ dead, const float* __restrict__ q_idx,
+        const int32_t* __restrict__ steps, int64_t max_blocks, float* __restrict__ out) {
+    const int64_t qi = blockIdx.y;
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int64_t b0 = ((int64_t) blockIdx.x * SCORE_WARPS + warp) * SCORE_BPW;
+    float4 qv[IDX_HEADS];
+#pragma unroll
+    for (int h = 0; h < IDX_HEADS; ++h)
+        qv[h] = *reinterpret_cast<const float4*>(q_idx + qi * IDX_HEADS * IDX_DIM + h * IDX_DIM + lane * 4);
+#pragma unroll
+    for (int j = 0; j < SCORE_BPW; ++j) {
+        const int64_t b = b0 + j;
+        // uniform across the warp (b depends on blockIdx.x and warp only), so the shuffles below stay in sync
+        if (b > n_bid || b >= max_blocks) continue;
+        const float* key = (b == n_bid) ? dead : pooled + b * IDX_DIM;
+        const float4 k4 = *reinterpret_cast<const float4*>(key + lane * 4);
+        float score = 0.0f;
+#pragma unroll
+        for (int h = 0; h < IDX_HEADS; ++h) {
+            float d = k4.x * qv[h].x + k4.y * qv[h].y + k4.z * qv[h].z + k4.w * qv[h].w;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+            score += d > 0.0f ? d : 0.0f;
+        }
+        if (lane == 0) {
+            if (b == n_bid && n_kv % R != 0) score += 1e9f;
+            out[qi * max_blocks + b] = score;
+        }
     }
 }
 
@@ -496,9 +553,15 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         return;
     }
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
-    const dim3 grid((unsigned) ((reach + SCORE_WARPS - 1) / SCORE_WARPS), (unsigned) nq);
-    block_scores_kernel<<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, max_blocks,
-                                                                              scores);
+    if (sm75_four_blocks()) {
+        const dim3 grid((unsigned) ((reach + SCORE_BPW * SCORE_WARPS - 1) / (SCORE_BPW * SCORE_WARPS)), (unsigned) nq);
+        block_scores_kernel_sm75<<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps,
+                                                                                       max_blocks, scores);
+    } else {
+        const dim3 grid((unsigned) ((reach + SCORE_WARPS - 1) / SCORE_WARPS), (unsigned) nq);
+        block_scores_kernel<<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps,
+                                                                                  max_blocks, scores);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
