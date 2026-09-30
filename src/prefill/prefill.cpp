@@ -56,6 +56,8 @@ Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product&, void*) {}
 void gather_native(const void*, const void*, size_t, const void*, size_t, void*, void*, void*) {}
+void gather_native_group(const void* const*, const void* const*, const void* const*, const void**, size_t, size_t,
+                         void*, void*, int, void*) {}
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
@@ -346,6 +348,7 @@ struct Prefill::Impl {
     // read and write them in place.  A cudaMemcpyAsync of them queues behind the expert blobs the copy stream already
     // holds (up to `ring` of them, ~70 us each), and the GPU idles meanwhile - measured 4.2 s of a 128K prompt's
     // 70 s at the default ring, 0.7 s with a 16-slot one.  STRATA_GROUP_COPY=1: the copies (the A/B arm).
+    const void** grp_src_dev = nullptr;   // sm_75: 3 * MMQ_GROUP source pointers for the batched gather
     int32_t* grp_host = nullptr;
     int32_t* grp_dev = nullptr;          // its device alias
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
@@ -648,6 +651,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     if (tc_sm75()) {
         m.xn16_f16 = o.take<uint16_t>(T * D, ok); m.lo16_f16 = o.take<uint16_t>(T * LR, ok);
         m.hc_w16 = o.take<uint16_t>((size_t) g.hc * (size_t) g.n_embd * (size_t) LR, ok);
+        m.grp_src_dev = (const void**) o.take<void*>(3 * MMQ_GROUP, ok);
     }
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
@@ -918,6 +922,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     if (tc_sm75()) {
         o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok);
         o.take<uint16_t>((size_t) g.hc * (size_t) g.n_embd * (size_t) LR, ok);
+        o.take<void*>(3 * MMQ_GROUP, ok);
     }
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
     if (bf16x2_hc()) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
@@ -1785,21 +1790,45 @@ if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
                     };
                     // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                     // expert) is released once the blob is read
+                    // sm_75 batched gather: the group's source pointers, flushed at the group boundary
+                    const void* grp_gate[MMQ_GROUP];
+                    const void* grp_up[MMQ_GROUP];
+                    const void* grp_down[MMQ_GROUP];
+                    int32_t grp_slot[MMQ_GROUP];
+                    int n_grp = 0;
                     auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
                         const int32_t e = order[j];
                         pt.mark(kPfDequant, cs);
                         if (use_mmq) {
-                            // gather the expert into its group slot (GGUF blocks, unchanged or converted)
+                            // gather the expert into its group slot (GGUF blocks, unchanged or converted).
+                            // sm_75: a native pack's experts are gathered for the WHOLE group in one launch
+                            // (the pointers are collected here and flushed at the group boundary below) -
+                            // per expert the copy is 2.15 MB at 247 GB/s, sixteen blocks cannot fill the card.
                             const size_t q = j % MMQ_GROUP;
-                            if (lay.native) {
+                            if (lay.native && m.grp_src_dev != nullptr) {
+                                const auto& f = lay.fmt[(size_t) l];
+                                grp_gate[n_grp] = blob_dev;
+                                grp_up[n_grp] = blob_dev + f.up_off;
+                                grp_down[n_grp] = blob_dev + f.down_off;
+                                grp_slot[n_grp] = slot;
+                                ++n_grp;
+                            } else if (lay.native) {
                                 const auto& f = lay.fmt[(size_t) l];
                                 mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
                                                    mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
                             } else {
                                 mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
                             }
-                            if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
                             if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                            if (n_grp > 0) {   // the group is complete: one copy for all of its experts
+                                mmq::gather_native_group(grp_gate, grp_up, grp_down, m.grp_src_dev, mmq_gub / 2,
+                                                         mmq_db, m.grp_gu, m.grp_d, n_grp, m.cs);
+                                for (int gi = 0; gi < n_grp; ++gi)
+                                    if (grp_slot[gi] >= 0) cudaEventRecord(m.used[grp_slot[gi]], m.cs);
+                                n_grp = 0;
+                            }
                             // the group's products: gate/up, swiglu, the group's H to q8_1, down
                             const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
                             const int ngx = (int) (q + 1);
