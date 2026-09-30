@@ -99,6 +99,30 @@
 #include <set>
 #include <vector>
 
+/// sm_75 (cc 7.5, and only 7.5) adds fp16 images and weight stagings to the prompt path.  Where the prompt path
+/// owns its buffers - no borrow - each one is its own cudaMalloc and the expert cache, sized from the empirical
+/// MiB formula below, is what leaves room for them.  The formula predates these buffers, so add their bytes back.
+/// Sizes from `Prefill::init`: xn16h = chunk * hc * n_embd * 2 (42 MB at chunk 2048), lo16h = chunk * hc_lr * 2,
+/// the staged weights = hc * n_embd * hc_lr * 2, the PLE staging = n_embd^2 * 2.
+/// Measured: without this the region relied on the formula's own slack (~50 MB), and a further 13 MB buffer
+/// failed with "prefill copy_i32: an illegal memory access".
+///
+/// The callers add this only where the empirical reserve actually stands in for the prompt path (the
+/// `prefill_mib`/`split_pf_mib` predicate).  When a stage borrows - the default with a profile - its loan is
+/// sized by the exact `Prefill::bytes_needed`, which prices these same buffers, so adding them again there
+/// would double-count.
+static int64_t sm75_prompt_extra_bytes(const strata::core::ModelGeometry& g, int64_t chunk, int dev) {
+    int maj = 0, min = 0;
+    if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&min, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    if (!strata::core::tc_sm75_enabled(maj, min) || chunk <= 0) return 0;
+    return chunk * g.hc * g.n_embd * 2 + chunk * g.hc_lr * 2 + g.hc * g.n_embd * g.hc_lr * 2 +
+           g.n_embd * g.n_embd * 2;
+}
+
 namespace {
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
@@ -2313,9 +2337,10 @@ int main(int argc, char** argv) {
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
-        const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + pf + (later ? kWindowMib : 0) +
-                                 (drafter ? kDrafterMib : 0)) << 20;
+const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
+        const int64_t reserve = (((int64_t) o.vram_reserve_mib + pf + (later ? kWindowMib : 0) +
+                                 (drafter ? kDrafterMib : 0)) << 20) +
+                                (split_pf_mib > 0 ? sm75_prompt_extra_bytes(g, o.prefill_chunk, dev) : 0);
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     if (multi_gpu && split_auto) {
@@ -2683,7 +2708,8 @@ int main(int argc, char** argv) {
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
         const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
                                      ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
-        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind;
+        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind +
+                                (prefill_mib > 0 ? sm75_prompt_extra_bytes(g, o.prefill_chunk, 0) : 0);
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
@@ -2700,7 +2726,8 @@ int main(int argc, char** argv) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
+        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) +
+                                (prefill_mib > 0 ? sm75_prompt_extra_bytes(g, o.prefill_chunk, 0) : 0);
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
             // a WARNING that names the knob: the user asked for this size, and gets fewer slots
