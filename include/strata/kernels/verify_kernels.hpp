@@ -37,7 +37,10 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                          const int32_t* n_keep, void* stream, int t_out_begin = 0);
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
-void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// `acc` (optional, STRATA_GPU_BUSY_TIMING) accumulates the spin's own duration in NANOSECONDS, so a run can say
+/// how much of the GPU's time is the GPU waiting for the host rather than working.  nullptr (the default) leaves
+/// the kernel byte-for-byte the old one.
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream, unsigned long long* acc = nullptr);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
 
@@ -49,7 +52,8 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream);
 /// wait_flag_ge that also returns when *skip == value (device memory).
-void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
+void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream,
+                     unsigned long long* acc = nullptr);
 /// copy_i32_from_mapped unless *skip == value.
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
                                  void* stream);

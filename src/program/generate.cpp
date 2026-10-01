@@ -5728,6 +5728,17 @@ const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_p
                     std::fprintf(stderr, "strata serve: stage %d: %lld windows; per window: wait for the GPU %.3f ms, "
                                          "pool + plan %.3f ms, host staging %.3f ms, commit %.3f ms\n", st,
                                  (long long) v.windows, v.ms_wait / w, v.ms_pool / w, v.ms_host / w, v.ms_commit / w);
+                    // STRATA_GPU_BUSY_TIMING: the same window, from the GPU's side - its own busy time (events
+                    // around the graph) and how much of it is a spin on the host's flags.
+                    if (v.busy_windows > 0)
+                        std::fprintf(stderr, "strata serve: stage %d: GPU busy %.3f ms/window (events, %lld windows); "
+                                             "wait_flag per window: pool plan %.3f + PCIe staging %.3f + CPU rows %.3f "
+                                             "= %.3f ms (%.1f%% of busy)\n", st,
+                                     v.ms_gpu_busy / (double) v.busy_windows, (long long) v.busy_windows,
+                                     v.ms_wait_flag[0] / w, v.ms_wait_flag[1] / w, v.ms_wait_flag[2] / w,
+                                     (v.ms_wait_flag[0] + v.ms_wait_flag[1] + v.ms_wait_flag[2]) / w,
+                                     100.0 * (v.ms_wait_flag[0] + v.ms_wait_flag[1] + v.ms_wait_flag[2]) /
+                                         (v.ms_gpu_busy > 0 ? v.ms_gpu_busy : 1.0));
                 }
             if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM

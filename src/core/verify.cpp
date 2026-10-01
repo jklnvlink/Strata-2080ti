@@ -172,6 +172,9 @@ Verifier::~Verifier() {
         slot.compare_exchange_strong(me, nullptr);
     }
     if (cs_) cudaStreamSynchronize(cs_);
+    for (auto& e : busy_ev_)
+        if (e) cudaEventDestroy(e);
+    if (wait_acc_) cudaFree(wait_acc_);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
@@ -334,6 +337,18 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
         else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
     }
+    // STRATA_GPU_BUSY_TIMING: the window graph's own GPU time (events around the launch) and the split of the
+    // wait_flag spins.  Off by default: with it off nothing is allocated and the wait kernels get a null counter,
+    // so the captured graph is the same graph.
+    busy_on_ = std::getenv("STRATA_GPU_BUSY_TIMING") != nullptr;
+    if (busy_on_) {
+        if (cudaEventCreate(&busy_ev_[0]) != cudaSuccess || cudaEventCreate(&busy_ev_[1]) != cudaSuccess ||
+            cudaMalloc((void**) &wait_acc_, 3 * sizeof(unsigned long long)) != cudaSuccess) {
+            busy_on_ = false; wait_acc_ = nullptr; cudaGetLastError();
+        } else {
+            cudaMemset(wait_acc_, 0, 3 * sizeof(unsigned long long));
+        }
+    }
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
@@ -403,6 +418,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int G = (split_ && T >= 2) ? 2 : 1;
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
+    // STRATA_GPU_BUSY_TIMING: which of the three wait_flag spins a given wait is (see the member's comment).
+    auto wacc = [&](int i) -> unsigned long long* { return busy_on_ ? wait_acc_ + i : nullptr; };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     groups_[T] = G;
 
@@ -728,10 +745,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
         if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
-            wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
+            wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs, wacc(0));
             copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
         } else {
-            wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
+            wait_flag_ge(m_flagA_, ring, cs, wacc(0));         // the pool published this group's GPU plan
             copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
         }
         stamp(l, 19, grp);
@@ -760,8 +777,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         grouped(p_ptr, p_start, p_counts);
         stamp(l, 20, grp);
-        if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-        else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+        if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs, wacc(1));
+        else wait_flag_ge(m_flagB_, ring, cs, wacc(1));        // the PCIe share is in staging (DMA) or mapped
         if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
             const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
             uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
@@ -772,11 +789,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         grouped(p_ptr2, p_start2, p_counts + 2);
         stamp(l, 22, grp);
         if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
-            wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+            wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs, wacc(2));
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                      skip_ + grp, ring, cs);
         } else {
-            wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
+            wait_flag_ge(m_flag_, ring, cs, wacc(2));      // the CPU's share is in the mapped rows
             stamp(l, 23, grp);
             if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
                 copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
@@ -1055,7 +1072,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
+    if (busy_on_) cudaEventRecord(busy_ev_[0], cs_);
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    if (busy_on_) cudaEventRecord(busy_ev_[1], cs_);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     VDBG("launched\n");
@@ -1129,6 +1148,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    if (busy_on_) {                 // the graph has completed (synced above): read the window's own GPU time back
+        float gms = 0.0f;
+        if (cudaEventElapsedTime(&gms, busy_ev_[0], busy_ev_[1]) == cudaSuccess) { ms_gpu_busy += gms; ++busy_windows; }
+        unsigned long long acc[3] = {0, 0, 0};
+        if (wait_acc_ != nullptr && cudaMemcpy(acc, wait_acc_, sizeof(acc), cudaMemcpyDeviceToHost) == cudaSuccess)
+            for (int i = 0; i < 3; ++i) {   // %globaltimer is ns and monotone: accumulate the deltas, never reset
+                if (acc[i] >= wait_acc_h_[i]) ms_wait_flag[i] += (double) (acc[i] - wait_acc_h_[i]) / 1e6;
+                wait_acc_h_[i] = acc[i];
+            }
+    }
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
         cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
         const int64_t L = g.n_layers;

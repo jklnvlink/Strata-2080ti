@@ -155,6 +155,13 @@ public:
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    /// STRATA_GPU_BUSY_TIMING=1 - the window graph's OWN GPU time, measured with CUDA events around
+    /// `cudaGraphLaunch` (no profiler needed), plus the breakdown of the `wait_flag` spins by the flag they wait
+    /// on: [0] flagA the pool's plan, [1] flagB the PCIe staging, [2] flag the CPU rows.  A spin is the GPU
+    /// idling on the host, so this separates "the GPU is working" from "the GPU is waiting for us" - the number
+    /// `STRATA_SPLIT_TIMING`'s `wait for the GPU` (the HOST waiting) cannot give.
+    double ms_gpu_busy = 0, ms_wait_flag[3] = {0, 0, 0};
+    int64_t busy_windows = 0;
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
@@ -191,6 +198,12 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+
+    // STRATA_GPU_BUSY_TIMING: the events around the window graph, and the device-side spin counters.
+    bool busy_on_ = false;
+    cudaEvent_t busy_ev_[2] = {nullptr, nullptr};
+    unsigned long long* wait_acc_ = nullptr;      // device: 3 counters (flagA / flagB / flag)
+    unsigned long long wait_acc_h_[3] = {0, 0, 0};
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

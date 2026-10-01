@@ -423,9 +423,18 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 }
 
 namespace {
-__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+/// The device's globaltimer, in nanoseconds - the same clock on every SM, so a one-thread spin can time itself
+/// without a calibration step (clock64() counts SM cycles, which a boost change would rescale).
+__device__ __forceinline__ unsigned long long flag_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value, unsigned long long* acc) {
+    const unsigned long long t0 = acc ? flag_ns() : 0ull;
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
+    if (acc) atomicAdd(acc, flag_ns() - t0);
 }
 }  // namespace
 
@@ -471,10 +480,13 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
     __threadfence();
     *skip = ring;
 }
-__global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
+__global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip,
+                                       unsigned long long* acc) {
     if (*skip == value) return;
+    const unsigned long long t0 = acc ? flag_ns() : 0ull;
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
+    if (acc) atomicAdd(acc, flag_ns() - t0);
 }
 __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,
                                        const uint32_t* skip, uint32_t value) {
@@ -496,8 +508,9 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                                                              blob, plan, capx, skip, ring);
     check("resident_plan");
 }
-void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
-    wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);
+void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream,
+                     unsigned long long* acc) {
+    wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip, acc);
     check("wait_flag_ge_or");
 }
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
@@ -516,8 +529,8 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     check("copy_or_zero_from_mapped");
 }
 
-void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
-    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream, unsigned long long* acc) {
+    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, acc);
     check("wait_flag_ge");
 }
 
