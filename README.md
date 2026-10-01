@@ -1,1 +1,1 @@
-基于上游的https://github.com/Niko1221/Strata的sm75优化fork
+基于[Strata](https://github.com/Niko1221/Strata)的sm75优化fork
