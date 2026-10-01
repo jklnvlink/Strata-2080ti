@@ -4327,6 +4327,17 @@ const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_p
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        // A3': --pcie-frac 0 means the pool never plans a PCIe group, so the window can omit that whole path
+        // (a provable no-op - see Verifier::set_no_pcie_share).  With the default auto-probe the fraction is
+        // non-zero and this stays off, so the default graph is unchanged.
+        {
+            const bool no_pcie = o.pcie_frac <= 0.0;
+            for (int st = 0; st < n_stages; ++st) stage_ver(st).set_no_pcie_share(no_pcie);
+            ver.set_no_pcie_share(no_pcie);
+            if (no_pcie)
+                std::fprintf(stderr, "strata generate: pcie_frac 0 -> the window omits the PCIe path "
+                                     "(no second grouped(), no staging copy)\n");
+        }
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
@@ -5321,6 +5332,9 @@ const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_p
             req_sp.counter = 0;
             ver.set_sampling(req_sp);
             mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+            // A3': the window graph was captured WITHOUT the PCIe path when pcie_frac is 0, so a request must not
+            // be able to raise it again - those misses have nowhere to go and would be silently dropped.
+            if (o.pcie_frac <= 0.0) req_pcie_frac = 0.0;
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
@@ -6143,6 +6157,7 @@ const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_p
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_no_pcie_share(o.pcie_frac <= 0.0);   // A3': see the split path above
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;

@@ -152,7 +152,13 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
-    /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    /// The pool will never plan a PCIe share (--pcie-frac 0): the window skips that path entirely.  Safe because
+    /// `ExpertDispatch::plan` computes `m = pcie_ok ? (nmiss * pcie_num) >> 8 : 0`, so with `pcie_num == 0`
+    /// `counts[2]` is ZERO for every group, every layer, every window - the second `grouped()`, the staging copy
+    /// and the pointer rebase then all do provably nothing, and dropping their launches is exactly equivalent
+    /// (not an approximation).  Must be set before the first `run`; the caller must also make sure no request
+    /// raises `pcie_frac` again, or those misses would be silently dropped.
+    void set_no_pcie_share(bool on) { no_pcie_share_ = on; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     /// STRATA_GPU_BUSY_TIMING=1 - the window graph's OWN GPU time, measured with CUDA events around
@@ -181,6 +187,7 @@ private:
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
+    bool no_pcie_share_ = false;          ///< set_no_pcie_share: the pool plans no PCIe group, so the graph omits that path
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)

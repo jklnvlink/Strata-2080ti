@@ -777,17 +777,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         grouped(p_ptr, p_start, p_counts);
         stamp(l, 20, grp);
-        if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs, wacc(1));
-        else wait_flag_ge(m_flagB_, ring, cs, wacc(1));        // the PCIe share is in staging (DMA) or mapped
-        if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-            const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-            uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+        // A3': with --pcie-frac 0 the pool plans no PCIe group at all, so counts[2] is zero everywhere and this
+        // whole block does provably nothing: the wait's flag is raised without any staging behind it, fetch_blobs
+        // and rebase_ptrs loop zero times, and the second grouped() launches kernels whose every block returns at
+        // its `g >= *n_groups` guard.  Dropping the launches is exact, not an approximation - measured on the
+        // 13 GiB tier it removes a CONSTANT 336 graph nodes per window (2,377 -> 2,041 at T=1, same delta at
+        // T=2/3/4/6: the second grouped() is 4 kernels per (layer, group), and the window has ~42 groups).
+        if (!no_pcie_share_) {
+            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs, wacc(1));
+            else wait_flag_ge(m_flagB_, ring, cs, wacc(1));    // the PCIe share is in staging (DMA) or mapped
+            if (sink_.pcie_mode == 2) {                        // stage it with a copy kernel, then point at staging
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            }
+            stamp(l, 21, grp);
+            grouped(p_ptr2, p_start2, p_counts + 2);
+            stamp(l, 22, grp);
         }
-        stamp(l, 21, grp);
-        grouped(p_ptr2, p_start2, p_counts + 2);
-        stamp(l, 22, grp);
         if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
             wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs, wacc(2));
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
