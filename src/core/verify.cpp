@@ -1358,44 +1358,6 @@ bool Verifier::commit(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
-    // STRATA_COMMIT_PARALLEL=1: the two stages' commit graphs touch DISJOINT state - `capture_commit` loops
-    // `for (l = lb_; l < le_; ++l)` and writes only THIS stage's gdn_state / qsa idx_tail / ple.hist.  The old
-    // shape (launch, wait, recurse) leaves one GPU idle for the whole of the other's commit; this launches
-    // every stage's graph first and only then waits, so both cards finalize their own state at once.
-    // Default off.  `ms_commit` then reports the overlapped span for every stage.
-    static const bool commit_par = [] {
-        const char* v = std::getenv("STRATA_COMMIT_PARALLEL");
-        return v != nullptr && std::atoi(v) != 0;
-    }();
-    if (commit_par) {
-        std::vector<Verifier*> chain;
-        for (Verifier* v = this; v != nullptr; v = v->next_) chain.push_back(v);
-        for (Verifier* v : chain) {
-            const OnDevice on_device_v(v->device_);
-            v->h_commit_[0] = n_keep;
-            v->h_commit_[1] = n_keep - 1;
-            for (int t = 0; t < v->max_t_; ++t)
-                v->h_commit_[2 + t] = t < n_keep ? (int32_t) (v->last_pos0_ + t) : -1;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            const cudaError_t le = cudaGraphLaunch(v->commit_exec_, v->cs_);
-            if (le != cudaSuccess) {
-                err = std::string("verify: commit launch: ") + cudaGetErrorString(le);
-                return false;
-            }
-        }
-        for (Verifier* v : chain) {
-            const OnDevice on_device_v(v->device_);
-            const cudaError_t se = cudaStreamSynchronize(v->cs_);
-            if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
-            if (v->ple_stage())   // stages that share one session must advance it once
-                for (int t = 0; t < n_keep; ++t) {
-                    v->ss_->ple_prev[0] = v->ss_->ple_prev[1];
-                    v->ss_->ple_prev[1] = v->last_tokens_[t];
-                }
-            v->ms_commit += ms_since(t0);
-        }
-        return true;
-    }
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
