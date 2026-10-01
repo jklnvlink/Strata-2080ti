@@ -48,6 +48,12 @@ public:
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    /// STRATA_DRAFT_STALE_R=1 (armed by bind()): the round reads the PREVIOUS window's final residual instead of the
+    /// one the window it drafts for will verify.  A draft is only ever verified, so this cannot change the output -
+    /// it changes how often a draft is accepted.  It exists to measure whether the draft's dependence on the
+    /// verifying window's residual (the stage1 -> draft edge of the window chain) can be relaxed: that edge is one
+    /// of the two that force the two cards to run strictly one after the other.  Default off.
+    bool stale_r() const { return stale_r_; }
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
@@ -127,6 +133,9 @@ private:
     const WeightTable* wt_ = nullptr;
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
+    float* R_prev_ = nullptr;   ///< STRATA_DRAFT_STALE_R: the previous window's final residual (max_t * hc * n_embd)
+    bool stale_r_ = false;
+    bool r_prev_init_ = false;
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;

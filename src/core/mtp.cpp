@@ -44,6 +44,13 @@ constexpr int GGML_Q8_0 = 8;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
+// STRATA_DRAFT_STALE_R: the draft round reads the previous window's final residual.  Diagnostic switch for the
+// window chain's stage1 -> draft edge (see the note on MtpDrafter::stale_r).  Default off.
+bool draft_stale_r_env() {
+    static const bool on = std::getenv("STRATA_DRAFT_STALE_R") != nullptr;
+    return on;
+}
+
 struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
@@ -253,6 +260,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(R2 * 4); pos_ = b.take<int32_t>(R2 * NH); row_ = b.take<int32_t>(4);
         ident_ = b.take<int32_t>(T * (uint64_t) cap_);
         Rin_ = b.take<float>(T * HC * N); R_ = b.take<float>(T * HC * N);
+        R_prev_ = b.take<float>(T * HC * N);   // STRATA_DRAFT_STALE_R's snapshot (unused, but reserved, otherwise)
         emb_ = b.take<float>(T * N); en_ = b.take<float>(T * N); e2_ = b.take<float>(T * N);
         hn_ = b.take<float>(T * HC * N); h2_ = b.take<float>(T * HC * N);
         mixed_ = b.take<float>(T * N); inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
@@ -377,6 +385,10 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     wt_ = &wt;
     head_ = head;
     window_R_ = window_R;
+    stale_r_ = draft_stale_r_env();
+    if (stale_r_ && R_prev_ != nullptr)
+        std::fprintf(stderr, "strata mtp: STRATA_DRAFT_STALE_R: the round drafts from the PREVIOUS window's final "
+                             "residual (diagnostic; the output is unchanged, the acceptance rate is not)\n");
     const WeightRef* wo = wt.find("output.weight");
     if (!wo) { err = "mtp: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
@@ -631,7 +643,8 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     copy_i32_from_mapped(step_, m_step_, (int64_t) 2 * T * 4, cs_);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) 2 * T * g_->n_head, cs_);
     copy_i32_from_mapped(row_, m_row_, 2, cs_);
-    copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
+    // STRATA_DRAFT_STALE_R bakes the snapshot pointer into the round graph: the switch must not be toggled mid-run.
+    copy_from_mapped(Rin_, (stale_r_ && R_prev_ != nullptr) ? R_prev_ : window_R_, (int64_t) T * HCN, cs_);
     // the catch-up: K/V for the window's T cells, then the full layer for row a only (its cell's K/V is written
     // again, identically), staged by the host in step row 2*max_t - 1; the draft chain is one graph per step
     // (`capture_step`) so the host can stop it when a draft is unlikely
@@ -774,6 +787,17 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     if (!capture_round(T, cp, err)) return false;
+    const int64_t HCN = g_->hc * g_->n_embd;
+    // STRATA_DRAFT_STALE_R: seed the snapshot with THIS window's residual before the first round, so round one is the
+    // fresh one and every later round is exactly one window behind.  Ordered on cs_ ahead of the round graph.
+    if (stale_r_ && R_prev_ != nullptr && !r_prev_init_) {
+        if (cudaMemcpyAsync(R_prev_, window_R_, (size_t) T * (size_t) HCN * sizeof(float),
+                            cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+            err = "mtp: stale-r warm-up copy";
+            return false;
+        }
+        r_prev_init_ = true;
+    }
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
     auto put = [&](int row, int64_t cell) {
@@ -819,6 +843,14 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (n_drafts) *n_drafts = n;
     ms_draft += ms_since(t0);
     ++rounds;
+    // STRATA_DRAFT_STALE_R: publish this window's residual for the NEXT round.  Ordered on cs_ ahead of that round's
+    // graph, which reads R_prev_; window_R_ is not written again until the next window's verify.
+    if (stale_r_ && R_prev_ != nullptr &&
+        cudaMemcpyAsync(R_prev_, window_R_, (size_t) T * (size_t) HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                        cs_) != cudaSuccess) {
+        err = "mtp: stale-r snapshot";
+        return false;
+    }
     return true;
 }
 

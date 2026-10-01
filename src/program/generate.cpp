@@ -5448,6 +5448,13 @@ const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_p
             const DecSnap ds0 = dec_snap();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
+            // STRATA_BRANCH_STAT=1: how well the previous window's draft probability predicts this window's accept
+            // branch ("was the draft accepted").  The branch is decided by the verification, so this histogram is the
+            // predictability bound of any schedule that runs the next window's first stage speculatively - the draft
+            // is the only signal that exists before the verifying window's second stage has finished.  Diagnostics.
+            static const bool branch_stat = std::getenv("STRATA_BRANCH_STAT") != nullptr;
+            double bs_n[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, bs_ok[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            float bs_prev_p = -1.0f;
             const int64_t decode_hits0 = drive.d.cache_hits;
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
@@ -5501,6 +5508,13 @@ const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_p
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (branch_stat && bs_prev_p >= 0.0f) {
+                    int b = (int) (bs_prev_p * 10.0f);
+                    if (b < 0) b = 0;
+                    if (b > 9) b = 9;
+                    bs_n[b] += 1.0;
+                    if (a >= 1) bs_ok[b] += 1.0;
+                }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -5534,6 +5548,7 @@ const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_p
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 const bool drafted = eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                if (branch_stat && drafted) bs_prev_p = dprob[0];
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -5577,6 +5592,16 @@ const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_p
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
                 const std::string pr = ver.profile_report();
                 if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
+            }
+            if (branch_stat) {
+                double bn = 0, bok = 0;
+                for (int b = 0; b < 10; ++b) { bn += bs_n[b]; bok += bs_ok[b]; }
+                std::fprintf(stderr, "strata branch stat: the window's draft probability vs the next window's accept "
+                                     "branch (%lld windows, %.3f accepted overall)\n", (long long) bn, bn > 0 ? bok / bn : 0.0);
+                for (int b = 0; b < 10; ++b)
+                    if (bs_n[b] > 0)
+                        std::fprintf(stderr, "  p in [%.1f,%.1f): n %6.0f, accepted %.3f\n", b / 10.0, (b + 1) / 10.0,
+                                     bs_n[b], bs_ok[b] / bs_n[b]);
             }
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
