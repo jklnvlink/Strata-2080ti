@@ -42,6 +42,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -1841,6 +1842,15 @@ int main(int argc, char** argv) {
     strata::kernels::native_qsa_set_enabled(o.native_qsa);
     strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
     strata::kernels::native_rope_set_enabled(o.native_rope);
+    // The ncols > 1 MMVQ layout.  true (the default) is the ncols == 1 layout, so every column of a multi-column
+    // call is bitwise what a single-column call would have produced; false is llama.cpp's generic multi-column
+    // table, which is only equal to it to float rounding (the cross-warp reduction groups partial sums
+    // differently).  Its speed was never measured here, which is why the exact layout is the default.  Set before
+    // anything captures a graph: a captured graph keeps the kernels it captured.
+    strata::kernels::native_mmvq_set_multi_exact([] {
+        const char* v = std::getenv("STRATA_MMVQ_MULTI_EXACT");
+        return v == nullptr || std::atoi(v) != 0;
+    }());
     // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
