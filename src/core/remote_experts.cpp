@@ -16,6 +16,30 @@ constexpr int64_t H = strata::kernels::cpu::H;
 constexpr int64_t FF = strata::kernels::cpu::FF;
 constexpr int64_t CAP = strata::kernels::cpu::MAXT * 10;
 
+// STRATA_REMOTE_TIMING -- attribute the per-layer HOST cost of the helper-GPU expert path.
+//
+// WHY.  `RemoteExperts::begin` was measured at **27 us per layer** of host staging on the 13 GiB Q2_0
+// decode, against a **44.8 us per layer** break-even for splitting a layer's experts across the two
+// cards (4.295 ms / 48 layers / 2).  Where those 27 us go decides whether cross-stage expert
+// parallelism is worth building at all -- and reading the source has already been wrong twice on this
+// engine, so this measures instead of guessing.  Off by default; when on, the serve loop prints one
+// line per request through `remote_experts_timing_report()`, which also resets the counters.
+struct RemoteTiming {
+    bool on = false;
+    double begin_routing = 0, begin_hostcopy = 0, begin_scope = 0, begin_upload = 0, begin_kernels = 0;
+    double begin_calls = 0;
+    double fin_scope = 0, fin_sync = 0, fin_copy = 0, fin_calls = 0;
+    RemoteTiming() {
+        const char* v = std::getenv("STRATA_REMOTE_TIMING");
+        on = v != nullptr && v[0] != '0';
+    }
+};
+RemoteTiming& timing() { static RemoteTiming t; return t; }
+using Clock = std::chrono::steady_clock;
+inline double ms_between(const Clock::time_point& a, const Clock::time_point& b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
 // Small enough to copy as one pinned buffer per layer. The kernels read the
 // individual arrays through pointers into the same device allocation.
 struct RemoteMeta {
@@ -235,6 +259,8 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     // cumulative host time in here (staging and launches), reported per request by the driver
     struct Timer { double& acc; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Timer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } timer{ms_begin_};
+    RemoteTiming& tm = timing();
+    const Clock::time_point t_enter = tm.on ? Clock::now() : Clock::time_point{};
     const int64_t n = n_tok * k;
     if (n <= 0 || n > CAP || n_tok > strata::kernels::cpu::MAXT || k != 10 || layer < 0 ||
         (size_t) layer >= layers_present_.size() || device_ < 0) {
@@ -275,6 +301,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         }
     }
     start_.push_back((int32_t) dst_.size());
+    const Clock::time_point t_routed = tm.on ? Clock::now() : Clock::time_point{};
     // Private pinned buffers survive until this GPU has consumed them. The CPU
     // pool can write other output rows without a cross-device race.
     std::memcpy(h_x_, x, (size_t) n_tok * H * sizeof(float));
@@ -284,14 +311,17 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     std::memcpy(meta->dst, dst_.data(), dst_.size() * sizeof(dst_[0]));
     std::memcpy(meta->tok, tok_.data(), tok_.size() * sizeof(tok_[0]));
     meta->count = (int32_t) group_id_.size();
+    const Clock::time_point t_copied = tm.on ? Clock::now() : Clock::time_point{};
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
+    const Clock::time_point t_scoped = tm.on ? Clock::now() : Clock::time_point{};
     groups_ = (int32_t) group_id_.size();
     const cudaStream_t s = stream_;
     const bool staged =
         (zero_copy_ || check(cudaMemcpyAsync(d_x_, h_x_, (size_t) n_tok * H * sizeof(float), cudaMemcpyHostToDevice, s), "copy input", err, device_)) &&
         check(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(RemoteMeta), cudaMemcpyHostToDevice, s), "copy group metadata", err, device_);
     if (!staged) return false;
+    const Clock::time_point t_uploaded = tm.on ? Clock::now() : Clock::time_point{};
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (lay.native) {
         strata::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
@@ -304,6 +334,15 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         strata::kernels::moe_grouped_s2(d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
                                         groups_, (int64_t) dst_.size(), d_q8_, d_scales_, d_scratch_, zero_copy_ ? z_out_ : d_out_, s);
     }
+    const Clock::time_point t_launched = tm.on ? Clock::now() : Clock::time_point{};
+    if (tm.on) {
+        tm.begin_routing += ms_between(t_enter, t_routed);
+        tm.begin_hostcopy += ms_between(t_routed, t_copied);
+        tm.begin_scope += ms_between(t_copied, t_scoped);
+        tm.begin_upload += ms_between(t_scoped, t_uploaded);
+        tm.begin_kernels += ms_between(t_uploaded, t_launched);
+        tm.begin_calls += 1;
+    }
     const uint64_t compact_bytes = (uint64_t) dst_.size() * H * sizeof(float);
     if (!zero_copy_ && !check(cudaMemcpyAsync(h_out_, d_out_, (size_t) compact_bytes, cudaMemcpyDeviceToHost, s),
                "copy results", err, device_)) return false;
@@ -315,14 +354,45 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
 
 bool RemoteExperts::finish(float* out, std::string& err) {
     if (group_id_.empty()) return true;
+    RemoteTiming& tm = timing();
+    const Clock::time_point f0 = tm.on ? Clock::now() : Clock::time_point{};
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
+    const Clock::time_point f1 = tm.on ? Clock::now() : Clock::time_point{};
     const auto w0 = std::chrono::steady_clock::now();
     if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) return false;
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+    const Clock::time_point f2 = tm.on ? Clock::now() : Clock::time_point{};
     for (size_t i = 0; i < original_row_.size(); ++i)
         std::memcpy(out + (size_t) original_row_[i] * H, h_out_ + i * H, (size_t) H * sizeof(float));
+    const Clock::time_point f3 = tm.on ? Clock::now() : Clock::time_point{};
+    if (tm.on) {
+        tm.fin_scope += ms_between(f0, f1);
+        tm.fin_sync += ms_between(f1, f2);
+        tm.fin_copy += ms_between(f2, f3);
+        tm.fin_calls += 1;
+    }
     return true;
+}
+
+std::string remote_experts_timing_report() {
+    RemoteTiming& tm = timing();
+    if (!tm.on) return std::string();
+    char buf[640];
+    auto per = [](double total, double calls) { return calls > 0 ? total / calls * 1000.0 : 0.0; };
+    std::snprintf(buf, sizeof(buf),
+        "strata serve: remote timing (us/layer over %.0f begin / %.0f finish): "
+        "routing %.1f | hostcopy %.1f | device-switch %.1f | meta-upload %.1f | kernel-launch %.1f "
+        "|| finish device-switch %.1f | finish sync %.1f | finish rowcopy %.1f",
+        tm.begin_calls, tm.fin_calls,
+        per(tm.begin_routing, tm.begin_calls), per(tm.begin_hostcopy, tm.begin_calls),
+        per(tm.begin_scope, tm.begin_calls), per(tm.begin_upload, tm.begin_calls),
+        per(tm.begin_kernels, tm.begin_calls),
+        per(tm.fin_scope, tm.fin_calls), per(tm.fin_sync, tm.fin_calls), per(tm.fin_copy, tm.fin_calls));
+    tm.begin_routing = tm.begin_hostcopy = tm.begin_scope = tm.begin_upload = tm.begin_kernels = 0;
+    tm.begin_calls = 0;
+    tm.fin_scope = tm.fin_sync = tm.fin_copy = tm.fin_calls = 0;
+    return std::string(buf);
 }
 
 } // namespace strata::core

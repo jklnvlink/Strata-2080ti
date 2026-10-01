@@ -5807,6 +5807,10 @@ const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_p
                              (double) (remote_experts[(size_t) r].full_row_bytes() - full_before[(size_t) r]) / 1048576.0,
                              remote_experts[(size_t) r].ms_begin() - begin_before[(size_t) r],
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
+            // STRATA_REMOTE_TIMING=1: where the per-layer host staging above actually goes.  The
+            // report resets its counters, so this is this request's own split.
+            if (const std::string rt = strata::core::remote_experts_timing_report(); !rt.empty())
+                std::fprintf(stderr, "%s\n", rt.c_str());
         }
         return 0;
     }

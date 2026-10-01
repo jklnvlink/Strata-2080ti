@@ -82,4 +82,14 @@ private:
     std::vector<unsigned long long> ptr_;
 };
 
+/// `STRATA_REMOTE_TIMING=1`: one line attributing the per-layer host cost of `begin`/`finish`
+/// (routing / host copy / device switch / metadata upload / kernel launch / finish sync), in
+/// microseconds per layer, over the calls since the previous report.  The counters are reset by
+/// the call, so the serve loop prints each request's own numbers.  Returns "" when the gate is off.
+///
+/// WHY IT EXISTS: `begin` measured 27 us/layer of host staging against a 44.8 us/layer break-even
+/// for splitting a layer's experts across two cards, so WHERE that time goes decides whether the
+/// split is worth building.  Reading the source to answer that has been wrong twice on this engine.
+std::string remote_experts_timing_report();
+
 } // namespace strata::core
