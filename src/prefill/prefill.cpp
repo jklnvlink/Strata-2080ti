@@ -91,6 +91,20 @@ inline int64_t stream_all_min() {
     static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) 1024; }();
     return v;
 }
+// The sm_75 batched group gather (one launch per MMQ_GROUP experts, reading their staging slots only at the group
+// boundary) against the per-expert gather, which reads each slot immediately.  A/B switch: STRATA_MMQ_BATCH_GATHER=0
+// selects the per-expert form.  Both compute an expert's products from the same bytes.
+//
+// The batched form defers a staging slot's read to the group boundary, so a pending group's slots must stay held
+// until then - the walk below does exactly that, and holding them is what removed the non-finite MoE output (a clean
+// request before, 256 x '!' after: layer 0, all seven bad experts STREAMED, resident=0).
+inline bool mmq_batch_gather() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_MMQ_BATCH_GATHER");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return v;
+}
 double g_pinned_share = 1.0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
@@ -1791,7 +1805,15 @@ if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
                     };
                     // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                     // expert) is released once the blob is read
-                    // sm_75 batched gather: the group's source pointers, flushed at the group boundary
+                    // sm_75 batched gather: the group's source pointers, flushed at the group boundary.
+                    //
+                    // THIS FORM DEFERS READING A STAGING SLOT TO THE GROUP BOUNDARY, so the slots of a pending group
+                    // must stay held until then - the walk below gives them back only at the boundary.  It is used
+                    // only when the ring can hold a whole group: with fewer slots than MMQ_GROUP two experts of one
+                    // group would alias a single buffer.  The per-expert form reads each slot immediately and is
+                    // correct in both cases, which is why it is the fallback.
+                    const bool batch_group = use_mmq && lay.native && m.grp_src_dev != nullptr &&
+                                             m.ring >= MMQ_GROUP && mmq_batch_gather();
                     const void* grp_gate[MMQ_GROUP];
                     const void* grp_up[MMQ_GROUP];
                     const void* grp_down[MMQ_GROUP];
@@ -1806,7 +1828,7 @@ if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
                             // (the pointers are collected here and flushed at the group boundary below) -
                             // per expert the copy is 2.15 MB at 247 GB/s, sixteen blocks cannot fill the card.
                             const size_t q = j % MMQ_GROUP;
-                            if (lay.native && m.grp_src_dev != nullptr) {
+                            if (batch_group) {
                                 const auto& f = lay.fmt[(size_t) l];
                                 grp_gate[n_grp] = blob_dev;
                                 grp_up[n_grp] = blob_dev + f.up_off;
@@ -1898,27 +1920,46 @@ if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
                         // pick only gives its slot back
                         size_t k = seq_start[(size_t) l];
                         const size_t kend = seq_start[(size_t) l + 1];
+                        // The pending group's first collected ring entry; every give_back below is capped at it, so
+                        // none of the group's staging slots is given back before `compute` has reached the group
+                        // boundary and issued its gather.  `(size_t) -1` = nothing held.
+                        size_t grp_hold_from = (size_t) -1;
                         auto release_to = [&](int32_t e_stop) {
                             while (k < kend && seq[k].e < e_stop) {
                                 cudaEventRecord(m.used[k % (size_t) m.ring], m.cs);
                                 consumed = ++k;
-                                give_back(consumed);
+                                give_back(consumed < grp_hold_from ? consumed : grp_hold_from);
                             }
                         };
                         for (size_t j = 0; j < order.size(); ++j) {
                             const int32_t e = order[j];
+                            // With the batched gather a group's staging slots are read only at the group boundary
+                            // (mmq::gather_native_group, MMQ_GROUP experts per launch).  Releasing them per expert -
+                            // as this loop did - let the issuer's next DMA land in a slot the gather had not read
+                            // yet: the group buffer then held another expert's bytes for the same weight columns on
+                            // every row, and the MoE output went non-finite.  Capping EVERY give_back at the group's
+                            // first entry is what holds them, including `release_to`'s - an entry the routing did not
+                            // pick sits between two of the group's own and would otherwise advance the watermark
+                            // past them.  The hold is at most MMQ_GROUP-1 entries and the ring holds >= MMQ_GROUP.
+                            // A group only starts after the previous one's flush, so the cap lifts there.
+                            const bool grp_boundary = !batch_group ||
+                                (j + 1) % (size_t) MMQ_GROUP == 0 || j + 1 == order.size();
+                            if (batch_group && j % (size_t) MMQ_GROUP == 0) grp_hold_from = (size_t) -1;
                             release_to(e);
                             if (k < kend && seq[k].e == e) {
                                 const int sl = (int) (k % (size_t) m.ring);
+                                if (batch_group && grp_hold_from == (size_t) -1) grp_hold_from = k;
                                 pt.mark(kPfWaitCopy, cs);
                                 wait_issued(k);
                                 cudaStreamWaitEvent(m.cs, m.copied[sl], 0);
                                 if (!compute(j, m.stage_dev[sl], sl)) return false;
                                 consumed = ++k;
-                                give_back(consumed);
+                                if (grp_boundary) { grp_hold_from = (size_t) -1; give_back(consumed); }
+                                else give_back(consumed < grp_hold_from ? consumed : grp_hold_from);
                             } else {
                                 ++stats_.experts_resident;
                                 if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
+                                if (grp_boundary) { grp_hold_from = (size_t) -1; give_back(consumed); }
                             }
                         }
                         release_to(m.g->n_expert);
