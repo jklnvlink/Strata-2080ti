@@ -1944,6 +1944,89 @@ if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
                                          "H %lld Dm %lld bo %lld of T %lld\n", (long long) l, (int) use_mmq, mmq_gt, mmq_dt,
                                          order.size(), (long long) bgu, (long long) bh, (long long) bdm, (long long) bbo,
                                          (long long) T);
+                            // STRATA_DBG_NAN detail (see docs/60-lessons): WHICH (token, expert) rows are bad, and
+                            // whether that expert was RESIDENT (a plain cache slot) or STREAMED (through a staging
+                            // ring slot).  Row r of GU/H/Dm is the expert-order row; m.off[e]..m.off[e+1] is expert
+                            // e's range, so r -> e is one upper_bound.  Scanned in row chunks: the full buffers are
+                            // 419 MB (GU) / 839 MB (Dm) and the engine is already near its cgroup cap.
+                            const int64_t ne = m.g->n_expert;
+                            auto rows_detail = [&](const char* name, const float* d, int64_t width) {
+                                if (d == nullptr || width <= 0) return;
+                                const int64_t rows = T * K;
+                                const int64_t chunk = std::min<int64_t>(rows, 4096);
+                                std::vector<float> h((size_t) chunk * (size_t) width);
+                                std::vector<int32_t> per((size_t) ne, 0);
+                                int64_t nrow = 0, shown = 0;
+                                for (int64_t r0 = 0; r0 < rows; r0 += chunk) {
+                                    const int64_t nr = std::min(chunk, rows - r0);
+                                    if (cudaMemcpy(h.data(), d + (size_t) r0 * (size_t) width,
+                                                   (size_t) nr * (size_t) width * sizeof(float),
+                                                   cudaMemcpyDeviceToHost) != cudaSuccess)
+                                        return;
+                                    for (int64_t i = 0; i < nr; ++i) {
+                                        const int64_t r = r0 + i;
+                                        const float* p = h.data() + (size_t) i * (size_t) width;
+                                        int64_t c0 = -1, c1 = -1, nb = 0;
+                                        for (int64_t c = 0; c < width; ++c)
+                                            if (!std::isfinite(p[c])) { if (c0 < 0) c0 = c; c1 = c; ++nb; }
+                                        if (c0 < 0) continue;
+                                        ++nrow;
+                                        const int32_t e = (int32_t) (std::upper_bound(m.off.begin(), m.off.end(),
+                                                                                      (int32_t) r) - m.off.begin() - 1);
+                                        if (e < 0 || e >= ne) continue;
+                                        ++per[(size_t) e];
+                                        if (shown++ < 6) {
+                                            const int32_t slot = m.host_res
+                                                ? m.host_res[(size_t) l * (size_t) ne + (size_t) e] : -1;
+                                            std::fprintf(stderr, "  %s badrow=%lld expert=%d %s cols=%lld..%lld "
+                                                         "(%lld of %lld) cnt=%d\n", name, (long long) r, (int) e,
+                                                         slot >= 0 ? "RESIDENT" : "STREAMED", (long long) c0,
+                                                         (long long) c1, (long long) nb, (long long) width,
+                                                         (int) m.cnt[(size_t) e]);
+                                        }
+                                    }
+                                }
+                                int64_t nex = 0, nres = 0, nstr = 0;
+                                for (int32_t e = 0; e < ne; ++e) {
+                                    if (!per[(size_t) e]) continue;
+                                    ++nex;
+                                    const int32_t slot = m.host_res
+                                        ? m.host_res[(size_t) l * (size_t) ne + (size_t) e] : -1;
+                                    if (slot >= 0) ++nres; else ++nstr;
+                                }
+                                std::fprintf(stderr, "  %s: badrows=%lld experts=%lld resident=%lld streamed=%lld\n",
+                                             name, (long long) nrow, (long long) nex, (long long) nres, (long long) nstr);
+                            };
+                            rows_detail("GU", m.GU, 1280);
+                            rows_detail("H", m.H, 640);
+                            rows_detail("Dm", m.Dm, N);
+                            // bo is token-indexed: name the tokens and the experts routed to each
+                            if (bbo > 0 && m.ids != nullptr) {
+                                std::vector<int32_t> rid((size_t) (T * K));
+                                std::vector<float> hb((size_t) T * (size_t) N);
+                                if (cudaMemcpy(rid.data(), m.ids, rid.size() * sizeof(int32_t),
+                                               cudaMemcpyDeviceToHost) == cudaSuccess &&
+                                    cudaMemcpy(hb.data(), m.bo, hb.size() * sizeof(float),
+                                               cudaMemcpyDeviceToHost) == cudaSuccess) {
+                                    int64_t shown = 0;
+                                    for (int64_t t = 0; t < T && shown < 6; ++t) {
+                                        const float* p = hb.data() + (size_t) t * (size_t) N;
+                                        int64_t nb = 0;
+                                        for (int64_t c = 0; c < N; ++c) nb += !std::isfinite(p[c]);
+                                        if (nb == 0) continue;
+                                        ++shown;
+                                        std::fprintf(stderr, "  bo badtoken=%lld nonfinite=%lld of %lld routed=",
+                                                     (long long) t, (long long) nb, (long long) N);
+                                        for (int64_t k = 0; k < K; ++k) {
+                                            const int32_t e = rid[(size_t) (t * K + k)];
+                                            const int32_t slot = (m.host_res && e >= 0 && e < ne)
+                                                ? m.host_res[(size_t) l * (size_t) ne + (size_t) e] : -1;
+                                            std::fprintf(stderr, " %d%s", (int) e, slot >= 0 ? "R" : "S");
+                                        }
+                                        std::fprintf(stderr, "\n");
+                                    }
+                                }
+                            }
                         }
                     }
                 }
