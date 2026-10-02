@@ -356,6 +356,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
     set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
   endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/residency_fingerprint_test.cpp")
+    # The resident set decides, per expert, whether the GPU kernel or the CPU path computes it;
+    # the fingerprint is how two runs' resident sets are compared.  CPU only - it takes a callable.
+    add_executable(residency_fingerprint_test tests/core/residency_fingerprint_test.cpp)
+    target_link_libraries(residency_fingerprint_test PRIVATE strata_engine)
+    add_test(NAME residency_fingerprint_test COMMAND residency_fingerprint_test)
+    set_tests_properties(residency_fingerprint_test PROPERTIES TIMEOUT 60)
+  endif()
   if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
     # native_experts.txt v2-v4 (the real packs' copies and the per-role shard column) and the arena filled from
     # synthetic GGUF shards at the real expert dimensions
