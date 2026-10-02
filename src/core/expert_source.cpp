@@ -216,7 +216,7 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
 }
 #endif
 
-bool available_memory_bytes(uint64_t& bytes) {
+bool mem_available_bytes(uint64_t& bytes) {
 #if defined(_WIN32)
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
@@ -1045,7 +1045,7 @@ bool FileExpertSource::pin_cache_complement(
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
         // they fit, the rest left on the mapped files; clamped to what the RAM has room for.
         uint64_t physical = 0;
-        if (!available_memory_bytes(physical)) {
+        if (!mem_available_bytes(physical)) {
             err = "FileExpertSource: cannot determine available RAM for --resident-budget-gib";
             return false;
         }
@@ -1101,7 +1101,7 @@ bool FileExpertSource::pin_cache_complement(
         // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own
         // allocations, the file cache) failed a budget the first one had clamped.  (A budget turns `lend` off.)
         uint64_t physical = budget_physical;
-        if (physical == 0 && !available_memory_bytes(physical)) {
+        if (physical == 0 && !mem_available_bytes(physical)) {
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
             return false;
         }
@@ -2321,5 +2321,10 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     // this class over `FileExpertSource`.
     return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
 }
+
+/// The public form (declared in the header): the same reading the file-local `mem_available_bytes`
+/// takes.  Renamed internally on 2026-10-02 so this one can be declared without the anonymous
+/// namespace's overload making every existing call site ambiguous.
+bool available_memory_bytes(uint64_t& bytes) { return mem_available_bytes(bytes); }
 
 }  // namespace strata::core

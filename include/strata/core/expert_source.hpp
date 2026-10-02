@@ -93,6 +93,14 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 
 
 
+/// `/proc/meminfo`'s `MemAvailable` in bytes, clamped to the tightest cgroup-v2 ancestor limit when
+/// one is visible.  Returns false when it cannot be read.
+///
+/// **A point-in-time reading, not a reservation** - a caller must treat it as a guard against an
+/// obviously hopeless start, never as memory it now owns.  (Declared here because the startup RAM
+/// gate in `generate.cpp` needs it; it was file-local before 2026-10-02.)
+bool available_memory_bytes(uint64_t& bytes);
+
 /// Where one routed expert's bytes come from.
 ///
 /// Phase 2 has NO cache (`phase-2-correct-engine.md`: hit rate `h = 0`), so the only implementation is a

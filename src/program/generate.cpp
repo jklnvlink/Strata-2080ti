@@ -22,6 +22,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/memory_gate.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
@@ -2644,6 +2645,43 @@ const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_p
         else if (pin_wddm_cap)
             std::fprintf(stderr, "strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned "
                                  "(STRATA_ARENA_PIN_GIB changes it)\n");
+        // A2 (2026-10-02): the startup RAM gate.  The arena is held RESIDENT, so starting into a
+        // machine that cannot also carry the desktop does not fail loudly - the kernel keeps ~48 GiB
+        // unreclaimable and the desktop (dsh-web / rustdesk) is what freezes.  This refuses the
+        // obviously hopeless start and names the numbers.  It runs ONCE, before the arena exists, and
+        // changes nothing on the inference path; STRATA_START_HEADROOM_GIB=0 turns the margin off.
+        {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            const uint64_t arena_need = lay.total + lay.max_blob;
+            // 1 GiB, from MEASUREMENT rather than taste.  Starting the engine on this box (desktop +
+            // dsh-web already up) sees MemAvailable fluctuate between 48.31 and 51.17 GiB against a
+            // 46.84 GiB arena.  Two defaults were tried and rejected against that measurement:
+            //   6 GiB -> refused EVERY start (a gate that always refuses is not a gate);
+            //   2 GiB -> refused at 48.83 GiB against a 48.84 GiB requirement, i.e. it flapped with
+            //            the page cache's own noise (measured 2026-10-02).
+            // 1 GiB sits below that fluctuation, so the normal start always passes, while the
+            // genuinely hopeless one (the arena itself barely fits) is still refused.
+            uint64_t headroom = 1ull << 30;
+            if (const char* v = std::getenv("STRATA_START_HEADROOM_GIB"); v != nullptr) {
+                const double gib = std::atof(v);
+                headroom = gib > 0.0 ? (uint64_t) (gib * 1073741824.0) : 0;
+            }
+            uint64_t avail = 0;
+            if (!strata::core::available_memory_bytes(avail)) {
+                std::fprintf(stderr, "strata generate: start memory gate: cannot read MemAvailable; "
+                                     "the check is skipped\n");
+            } else {
+                const auto gate = strata::core::memory_gate(avail, arena_need, headroom);
+                std::fprintf(stderr, "strata generate: start memory gate: %.2f GiB available, "
+                                     "%.2f GiB arena + %.2f GiB headroom -> %s\n",
+                             (double) avail / 1073741824.0, (double) arena_need / 1073741824.0,
+                             (double) headroom / 1073741824.0, gate.ok ? "ok" : "REFUSED");
+                if (!gate.ok) {
+                    std::fprintf(stderr, "strata generate: %s\n", gate.message.c_str());
+                    return 1;
+                }
+            }
+        }
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());

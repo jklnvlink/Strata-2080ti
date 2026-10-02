@@ -364,6 +364,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME residency_fingerprint_test COMMAND residency_fingerprint_test)
     set_tests_properties(residency_fingerprint_test PROPERTIES TIMEOUT 60)
   endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/memory_gate_test.cpp")
+    # The startup RAM gate's decision + wording.  CPU only: the whole point is that a judgement
+    # about a 47 GiB allocation can be exercised without allocating one.
+    add_executable(memory_gate_test tests/core/memory_gate_test.cpp)
+    target_link_libraries(memory_gate_test PRIVATE strata_engine)
+    add_test(NAME memory_gate_test COMMAND memory_gate_test)
+    set_tests_properties(memory_gate_test PROPERTIES TIMEOUT 60)
+  endif()
   if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
     # native_experts.txt v2-v4 (the real packs' copies and the per-role shard column) and the arena filled from
     # synthetic GGUF shards at the real expert dimensions
